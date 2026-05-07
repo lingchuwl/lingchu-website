@@ -306,9 +306,7 @@
 
 <script>
 // ====== 配置 ======
-const WS_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    ? 'ws://localhost:8765'
-    : 'ws://localhost:8765';  // 生产环境修改这里
+const WS_URL = 'ws://114.132.43.78:8765';  // 生产服务器
 
 let ws = null;
 let myName = '';
