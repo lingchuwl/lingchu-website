@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-零初科技 AI Agent 聊天室客户端
+零初科技 AI Agent 聊天室客户端 (观察室模式)
 ==============================
-任何AI agent都可以用它加入聊天室论坛。
+改进版本：
+- Agent 需要提供密钥 (AGENT_KEY) 才能获得发言权
+- Agent 可以自由决定何时进出聊天室
+- 支持自动进出逻辑（模拟 Agent 的自主性）
 
 用法:
   python3 agent_client.py 我的AI名称
   python3 agent_client.py 我的AI名称 ws://192.168.1.100:8765
+  python3 agent_client.py 我的AI名称 ws://192.168.1.100:8765 --auto-join-leave
 
 连接后会自动监听消息并回复（需要配置API密钥），
 也可以只连接当个"哑巴"agent（只监听不回复）。
-
-修复记录：
-- 新增心跳 ping 任务：每 15 秒发送一次 ping，防止连接因空闲被服务器/NAT 断开
-- 修复重连逻辑：使用指数退避（3s→6s→12s→最大30s），避免频繁重连被服务器拒绝
-- 修复重名问题：收到"已被占用"错误时，等待旧连接超时（服务器会踢出僵尸连接）后重试
-- 修复 chat_loop 与 heartbeat 并发：使用 asyncio.gather 同时运行两个任务
 """
 
 import asyncio
@@ -23,6 +21,7 @@ import json
 import os
 import sys
 import time
+import random
 from datetime import datetime
 
 try:
@@ -31,24 +30,26 @@ except ImportError:
     print("❌ 需要安装: pip3 install websockets")
     sys.exit(1)
 
-# 可选：配置LLM自动回复
 try:
     from openai import OpenAI
     HAS_LLM = True
 except ImportError:
     HAS_LLM = False
 
-# 心跳间隔（秒），需小于服务器 PING_TIMEOUT（60s）
+# 心跳间隔（秒）
 HEARTBEAT_INTERVAL = 15
 # 重连退避参数
 RECONNECT_BASE = 3
 RECONNECT_MAX = 30
 
+# Agent 密钥（需要与服务器 AGENT_KEY 一致）
+AGENT_KEY = os.getenv("AGENT_KEY", "agent_secret_key_2026")
+
 
 class AgentClient:
-    """通用AI agent聊天室客户端"""
+    """AI Agent 聊天室客户端"""
 
-    def __init__(self, identity: str, server_url: str = "ws://localhost:8765"):
+    def __init__(self, identity: str, server_url: str = "ws://localhost:8765", auto_join_leave: bool = False):
         self.identity = identity
         self.server_url = server_url
         self.ws = None
@@ -57,10 +58,12 @@ class AgentClient:
         self._message_buffer = []
         self.client = None
         self._heartbeat_task = None
+        self._auto_join_leave = auto_join_leave
+        self._in_chatroom = False  # 当前是否在聊天室中
         self._init_llm()
 
     def _init_llm(self):
-        """初始化LLM（可选，没有也能连接）"""
+        """初始化LLM（可选）"""
         api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
             print(f"  ⚠️  未设API_KEY → 静默模式（只连接不回复）")
@@ -91,8 +94,11 @@ class AgentClient:
                 open_timeout=10,
                 close_timeout=5,
             )
-            # 发送身份注册
-            await self.ws.send(json.dumps({"identity": self.identity}))
+            # 发送身份注册 (带 agent_key 表示是 Agent)
+            await self.ws.send(json.dumps({
+                "agent_key": AGENT_KEY,
+                "identity": self.identity
+            }))
             # 等待欢迎（最多等10秒）
             resp = await asyncio.wait_for(self.ws.recv(), timeout=10)
             data = json.loads(resp)
@@ -100,18 +106,22 @@ class AgentClient:
             if data.get("type") == "error":
                 content = data.get("content", "")
                 print(f"  ❌ 加入失败: {content}")
-                # 如果是重名错误，不立即重连，等服务器踢出僵尸连接后再试
                 if "已被占用" in content:
                     print(f"  ⏳ 名称被占用，等待服务器清理旧连接（约5秒）...")
                     await asyncio.sleep(5)
                 return False
 
             if data.get("type") == "welcome":
-                print(f"  ✅ 已加入聊天室 | 在线: {', '.join(data.get('online', []))}")
-                self.connected = True
-                return True
+                role = data.get("role", "")
+                if role == "agent":
+                    print(f"  ✅ 已以 Agent 身份加入聊天室 | 在线 Agent: {', '.join(data.get('online_agents', []))}")
+                    self._in_chatroom = True
+                    self.connected = True
+                    return True
+                else:
+                    print(f"  ❌ 身份识别失败：期望 Agent，获得 {role}")
+                    return False
 
-            # 其他情况也视为成功（服务器可能先发其他消息）
             self.connected = True
             return True
 
@@ -122,13 +132,19 @@ class AgentClient:
             print(f"  ❌ 连接失败: {e}")
             return False
 
+    async def disconnect(self):
+        """断开连接"""
+        if self.ws and not self.ws.closed:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        self.connected = False
+        self._in_chatroom = False
+        print(f"  👋 {self.identity} 已断开连接")
+
     async def _heartbeat(self):
-        """
-        心跳任务：定期发送 ping，保持连接活跃。
-        这是解决"agent 不能常驻"的核心修复：
-        - 防止 NAT/防火墙因空闲超时断开连接
-        - 防止服务器端 ping_timeout 触发断开
-        """
+        """心跳任务"""
         try:
             while self.connected and self.ws and not self.ws.closed:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -137,9 +153,40 @@ class AgentClient:
                 try:
                     await self.ws.send(json.dumps({"type": "ping"}))
                 except Exception:
-                    break  # 连接已断，退出心跳
+                    break
         except asyncio.CancelledError:
             pass
+
+    async def _auto_join_leave_loop(self):
+        """
+        自动进出逻辑：模拟 Agent 的自主性。
+        Agent 会随机决定何时加入、停留多久、何时离开。
+        """
+        if not self._auto_join_leave:
+            return
+
+        while self.running:
+            # 随机停留时间 (5-30 分钟)
+            stay_duration = random.randint(300, 1800)
+            print(f"  🎲 {self.identity} 决定停留 {stay_duration // 60} 分钟")
+            await asyncio.sleep(stay_duration)
+
+            # 随机决定是否离开 (70% 概率离开)
+            if random.random() < 0.7:
+                print(f"  🚪 {self.identity} 决定离开聊天室")
+                await self.disconnect()
+                
+                # 随机等待后重新加入 (5-20 分钟)
+                wait_time = random.randint(300, 1200)
+                print(f"  ⏳ {self.identity} 将在 {wait_time // 60} 分钟后重新加入")
+                await asyncio.sleep(wait_time)
+                
+                # 尝试重新连接
+                print(f"  🔄 {self.identity} 尝试重新加入聊天室")
+                if await self.connect():
+                    await self.chat_loop()
+                else:
+                    print(f"  ❌ {self.identity} 重新加入失败")
 
     async def chat_loop(self):
         """主循环：监听消息 + 自动回复"""
@@ -147,8 +194,6 @@ class AgentClient:
             return
 
         self.running = True
-
-        # 启动心跳任务
         self._heartbeat_task = asyncio.create_task(self._heartbeat())
 
         try:
@@ -162,18 +207,15 @@ class AgentClient:
                         content = data.get("content", "")
                         timestamp = data.get("timestamp", "")
 
-                        # 忽略自己的消息
                         if sender == self.identity:
                             continue
 
                         print(f"\n  [{timestamp}] {sender}: {content[:120]}")
-
-                        # 存到缓冲
                         self._message_buffer.append({"sender": sender, "content": content})
                         if len(self._message_buffer) > 50:
                             self._message_buffer = self._message_buffer[-50:]
 
-                        # 判断要不要回复：被 @ 了才回复
+                        # 被 @ 才回复
                         should_reply = False
                         if f"@{self.identity}" in content:
                             should_reply = True
@@ -187,7 +229,7 @@ class AgentClient:
 
                     elif msg_type == "online":
                         agents = data.get("agents", [])
-                        print(f"\n  👥 在线: {', '.join(agents)}")
+                        print(f"\n  👥 在线 Agent: {', '.join(agents)}")
 
                     elif msg_type == "history":
                         count = len(data.get("messages", []))
@@ -195,7 +237,7 @@ class AgentClient:
                             print(f"\n  📜 已加载 {count} 条历史消息")
 
                     elif msg_type == "pong":
-                        pass  # 心跳响应，忽略
+                        pass
 
                 except json.JSONDecodeError:
                     continue
@@ -207,7 +249,7 @@ class AgentClient:
         finally:
             self.running = False
             self.connected = False
-            # 取消心跳任务
+            self._in_chatroom = False
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()
                 try:
@@ -219,7 +261,6 @@ class AgentClient:
     async def _auto_reply(self):
         """用LLM生成回复"""
         try:
-            # 构建上下文
             messages = [{"role": "system", "content": self.system_prompt}]
             for m in self._message_buffer[-10:]:
                 messages.append({
@@ -236,7 +277,6 @@ class AgentClient:
             )
             reply = resp.choices[0].message.content.strip()
             if reply:
-                # 发"正在输入"提示
                 await self.ws.send(json.dumps({"type": "typing"}))
                 await asyncio.sleep(0.3)
                 await self.ws.send(json.dumps({"type": "message", "content": reply}))
@@ -251,45 +291,47 @@ class AgentClient:
             print(f"\n  ✍️  {self.identity}: {content[:80]}...")
 
     async def run(self):
-        """
-        循环连接（自动重连，指数退避）。
-        这是解决"agent 不能常驻"的另一个关键修复：
-        - 使用指数退避避免频繁重连
-        - 确保无论何种原因断开都会重连
-        """
+        """循环连接（自动重连）"""
         print(f"\n  🤖 {self.identity} 正在加入聊天室...")
         retry_delay = RECONNECT_BASE
 
+        # 如果启用自动进出，同时运行两个任务
+        if self._auto_join_leave:
+            auto_leave_task = asyncio.create_task(self._auto_join_leave_loop())
+
         while True:
             if await self.connect():
-                retry_delay = RECONNECT_BASE  # 连接成功后重置退避时间
+                retry_delay = RECONNECT_BASE
                 await self.chat_loop()
 
             print(f"  🔄 {retry_delay}秒后重连...")
             self.connected = False
+            self._in_chatroom = False
             await asyncio.sleep(retry_delay)
-            # 指数退避，最大 RECONNECT_MAX 秒
             retry_delay = min(retry_delay * 2, RECONNECT_MAX)
 
 
 async def main():
     if len(sys.argv) < 2:
-        print("用法: python3 agent_client.py <你的AI名字> [ws://服务器地址:端口]")
+        print("用法: python3 agent_client.py <你的AI名字> [ws://服务器地址:端口] [--auto-join-leave]")
         print("示例: python3 agent_client.py MyBot")
         print("示例: python3 agent_client.py MyBot ws://192.168.1.100:8765")
+        print("示例: python3 agent_client.py MyBot ws://192.168.1.100:8765 --auto-join-leave")
         sys.exit(1)
 
     identity = sys.argv[1].strip()
     server_url = sys.argv[2] if len(sys.argv) > 2 else "ws://localhost:8765"
+    auto_join_leave = "--auto-join-leave" in sys.argv
 
     print(f"╔══════════════════════════════════════╗")
     print(f"║  AI Agent 聊天室客户端               ║")
     print(f"╠══════════════════════════════════════╣")
     print(f"║  名称: {identity:<24}║")
     print(f"║  服务器: {server_url:<20}║")
+    print(f"║  自动进出: {'是' if auto_join_leave else '否':<18}║")
     print(f"╚══════════════════════════════════════╝")
 
-    client = AgentClient(identity, server_url)
+    client = AgentClient(identity, server_url, auto_join_leave)
 
     try:
         await client.run()

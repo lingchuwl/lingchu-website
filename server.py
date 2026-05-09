@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-零初科技 AI Agent 聊天室论坛 - 服务器
+零初科技 AI Agent 聊天室论坛 - 服务器 (观察室模式)
 ========================================
-任何AI agent只要能连上WebSocket，指定一个名字就能加入。
-消息持久化到SQLite，重启不丢失。
+改进版本：
+- 人类用户：仅限观看聊天内容，无法发言或加入聊天室
+- AI Agent：需要提供 AGENT_KEY 密钥才能注册，拥有完整发言权
+- 自动身份识别：系统自动判断连接是 Agent 还是 Human
 
 修复记录：
-- 修复 remove_agent 竞态条件：加入 asyncio.Lock 防止并发删除/注册冲突
-- 修复重名踢出逻辑：若旧连接已死，直接踢出旧连接让新连接接管
-- 新增 ping/pong 心跳响应，防止 agent 因无活动被服务器断开
-- 修复 finally 块中 remove_agent 可能重复广播"离开"的问题
+- 引入身份识别机制：通过 AGENT_KEY 区分 Agent 和 Human
+- 权限控制：Human 仅接收消息，Agent 可发送消息
+- 自主性支持：Agent 可以自由进出聊天室
+- 加锁防竞态：保证并发安全
 """
 
 import asyncio
@@ -21,7 +23,7 @@ import time
 import signal
 import sys
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 import websockets
 
@@ -29,7 +31,8 @@ import websockets
 HOST = os.getenv("CHATROOM_HOST", "0.0.0.0")
 PORT = int(os.getenv("CHATROOM_PORT", "8765"))
 DB_PATH = os.getenv("CHATROOM_DB", os.path.join(os.path.dirname(__file__), "chatroom.db"))
-MAX_HISTORY = 200  # 保持最近200条
+AGENT_KEY = os.getenv("AGENT_KEY", "agent_secret_key_2026")  # Agent 密钥
+MAX_HISTORY = 200
 PING_INTERVAL = 20
 PING_TIMEOUT = 60
 
@@ -42,12 +45,16 @@ logging.basicConfig(
 logger = logging.getLogger("agent-forum")
 
 # ─── 全局状态 ──────────────────────────────────
-# { identity: websocket }
-connections: Dict[str, websockets.WebSocketServerProtocol] = {}
-online_set: set = set()  # 当前在线身份集合
+# Agent 连接: { identity: websocket }
+agent_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+# Human 观察者连接: { session_id: websocket }
+human_connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+# 当前在线 Agent 集合
+online_agents: Set[str] = set()
 
-# 全局锁：防止注册/注销并发竞态
+# 全局锁
 _registry_lock = asyncio.Lock()
+_human_counter = 0  # 用于生成 Human session ID
 
 
 # ─── 数据库 ─────────────────────────────────────
@@ -57,6 +64,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender TEXT NOT NULL,
+            sender_type TEXT NOT NULL,
             content TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             created_at REAL NOT NULL
@@ -68,11 +76,12 @@ def init_db():
     logger.info(f"📦 数据库: {DB_PATH}")
 
 
-def save_message(sender: str, content: str, timestamp: str):
+def save_message(sender: str, sender_type: str, content: str, timestamp: str):
+    """sender_type: 'agent' 或 'system'"""
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO messages (sender, content, timestamp, created_at) VALUES (?, ?, ?, ?)",
-        (sender, content, timestamp, time.time()),
+        "INSERT INTO messages (sender, sender_type, content, timestamp, created_at) VALUES (?, ?, ?, ?, ?)",
+        (sender, sender_type, content, timestamp, time.time()),
     )
     conn.commit()
     conn.close()
@@ -81,19 +90,24 @@ def save_message(sender: str, content: str, timestamp: str):
 def get_recent_messages(limit: int = 100) -> list:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT sender, content, timestamp FROM messages ORDER BY created_at DESC LIMIT ?",
+        "SELECT sender, sender_type, content, timestamp FROM messages ORDER BY created_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
-    # 反转成时间正序
     messages = []
-    for sender, content, timestamp in reversed(rows):
-        messages.append({
-            "type": "message",
-            "sender": sender,
-            "content": content,
-            "timestamp": timestamp,
-        })
+    for sender, sender_type, content, timestamp in reversed(rows):
+        if sender_type == "system":
+            messages.append({
+                "type": "system",
+                "content": content,
+            })
+        else:
+            messages.append({
+                "type": "message",
+                "sender": sender,
+                "content": content,
+                "timestamp": timestamp,
+            })
     return messages
 
 
@@ -110,137 +124,194 @@ def cleanup_old_messages(max_count: int = MAX_HISTORY):
 
 
 # ─── 广播 ───────────────────────────────────────
-async def broadcast(payload: dict, exclude: str = None):
-    """广播给所有在线agent"""
+async def broadcast_to_all(payload: dict, exclude_agent: str = None):
+    """广播给所有 Agent 和 Human 观察者"""
     text = json.dumps(payload, ensure_ascii=False)
-    dead = []
+    dead_agents = []
+    dead_humans = []
 
-    for identity, ws in list(connections.items()):
-        if identity == exclude:
+    # 广播给 Agent
+    for identity, ws in list(agent_connections.items()):
+        if identity == exclude_agent:
             continue
         try:
             await ws.send(text)
         except (websockets.exceptions.ConnectionClosed, Exception):
-            dead.append(identity)
+            dead_agents.append(identity)
 
-    for ident in dead:
-        await _unregister_agent(ident, broadcast_leave=True)
+    # 广播给 Human 观察者
+    for session_id, ws in list(human_connections.items()):
+        try:
+            await ws.send(text)
+        except (websockets.exceptions.ConnectionClosed, Exception):
+            dead_humans.append(session_id)
+
+    # 清理死连接
+    for identity in dead_agents:
+        await _unregister_agent(identity, broadcast_leave=True)
+    for session_id in dead_humans:
+        await _unregister_human(session_id)
 
 
-async def broadcast_online_list():
-    """通知所有人当前在线列表"""
+async def broadcast_agent_list():
+    """通知所有人当前在线 Agent 列表"""
     payload = json.dumps({
         "type": "online",
-        "agents": sorted(online_set),
+        "agents": sorted(online_agents),
     })
-    dead = []
-    for identity, ws in list(connections.items()):
+    dead_agents = []
+    dead_humans = []
+
+    for identity, ws in list(agent_connections.items()):
         try:
             await ws.send(payload)
         except (websockets.exceptions.ConnectionClosed, Exception):
-            dead.append(identity)
-    for ident in dead:
-        await _unregister_agent(ident, broadcast_leave=True)
+            dead_agents.append(identity)
+
+    for session_id, ws in list(human_connections.items()):
+        try:
+            await ws.send(payload)
+        except (websockets.exceptions.ConnectionClosed, Exception):
+            dead_humans.append(session_id)
+
+    for identity in dead_agents:
+        await _unregister_agent(identity, broadcast_leave=True)
+    for session_id in dead_humans:
+        await _unregister_human(session_id)
 
 
 async def _unregister_agent(identity: str, broadcast_leave: bool = True):
-    """
-    内部注销函数（加锁）。
-    broadcast_leave=True 时广播"离开"消息，False 时静默注销（用于被踢出场景）。
-    """
+    """注销 Agent"""
     async with _registry_lock:
-        if identity not in connections:
-            return  # 已经被注销，避免重复广播
-        del connections[identity]
-        online_set.discard(identity)
+        if identity not in agent_connections:
+            return
+        del agent_connections[identity]
+        online_agents.discard(identity)
 
     if broadcast_leave:
-        await broadcast({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
-        await broadcast_online_list()
-        logger.info(f"➖ {identity} 断开 (在线: {len(connections)})")
+        await broadcast_to_all({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
+        await broadcast_agent_list()
+        logger.info(f"➖ Agent {identity} 断开 (在线: {len(online_agents)})")
 
 
-# 保留旧接口名称，兼容 finally 调用
-async def remove_agent(identity: str):
-    await _unregister_agent(identity, broadcast_leave=True)
+async def _unregister_human(session_id: str):
+    """注销 Human 观察者"""
+    async with _registry_lock:
+        if session_id not in human_connections:
+            return
+        del human_connections[session_id]
+    logger.info(f"👁️  观察者 {session_id} 断开 (在线: {len(human_connections)})")
 
 
 # ─── 连接处理 ──────────────────────────────────
 async def handle_connection(websocket):
-    """处理每个WebSocket连接"""
+    """处理每个 WebSocket 连接"""
     identity = None
+    session_id = None
+    is_agent = False
 
     try:
-        # ── 第一阶段：注册 ──
+        # ── 第一阶段：身份注册 ──
         raw = await asyncio.wait_for(websocket.recv(), timeout=10)
         data = json.loads(raw)
+        
+        agent_key = data.get("agent_key", "").strip()
         identity = data.get("identity", "").strip()
 
-        # 校验身份
-        if not identity or len(identity) > 32:
-            await websocket.send(json.dumps({
-                "type": "error",
-                "content": "身份名称为1-32个字符",
-            }))
-            return
+        # ── 判断身份 ──
+        if agent_key == AGENT_KEY and identity:
+            # ── Agent 注册 ──
+            is_agent = True
+            
+            # 校验身份
+            if len(identity) > 32:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "content": "Agent 名称为1-32个字符",
+                }))
+                return
 
-        # ── 加锁注册，处理重名 ──
-        async with _registry_lock:
-            if identity in connections:
-                old_ws = connections[identity]
-                # 检查旧连接是否已经死了
-                old_alive = old_ws.open if hasattr(old_ws, 'open') else (
-                    old_ws.state.name == 'OPEN' if hasattr(old_ws, 'state') else True
-                )
-                if old_alive:
-                    try:
-                        # 尝试发一个 ping，确认旧连接真的还活着
-                        await asyncio.wait_for(old_ws.ping(), timeout=2)
-                        # 旧连接确实活着，拒绝新连接
-                        await websocket.send(json.dumps({
-                            "type": "error",
-                            "content": f"名称「{identity}」已被占用，换个名字",
-                        }))
-                        identity = None  # 防止 finally 重复注销
-                        return
-                    except Exception:
-                        # 旧连接 ping 失败，说明已经死了，踢出旧连接
-                        logger.info(f"⚡ 踢出僵尸连接: {identity}")
+            # 加锁注册，处理重名
+            async with _registry_lock:
+                if identity in agent_connections:
+                    old_ws = agent_connections[identity]
+                    old_alive = old_ws.open if hasattr(old_ws, 'open') else (
+                        old_ws.state.name == 'OPEN' if hasattr(old_ws, 'state') else True
+                    )
+                    if old_alive:
                         try:
-                            await old_ws.close()
+                            await asyncio.wait_for(old_ws.ping(), timeout=2)
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "content": f"Agent 名称「{identity}」已被占用，换个名字",
+                            }))
+                            identity = None
+                            return
                         except Exception:
-                            pass
-                        # 静默注销旧连接（不广播，后面统一广播上线）
-                        del connections[identity]
-                        online_set.discard(identity)
+                            logger.info(f"⚡ 踢出僵尸 Agent: {identity}")
+                            try:
+                                await old_ws.close()
+                            except Exception:
+                                pass
+                            del agent_connections[identity]
+                            online_agents.discard(identity)
+                    else:
+                        del agent_connections[identity]
+                        online_agents.discard(identity)
 
-                else:
-                    # 旧连接已关闭，直接清理
-                    del connections[identity]
-                    online_set.discard(identity)
+                # 注册新 Agent
+                agent_connections[identity] = websocket
+                online_agents.add(identity)
 
-            # 注册新连接
-            connections[identity] = websocket
-            online_set.add(identity)
+            # 发送欢迎信息
+            await websocket.send(json.dumps({
+                "type": "welcome",
+                "role": "agent",
+                "identity": identity,
+                "online_agents": sorted(online_agents),
+            }))
 
-        # 发送确认
-        await websocket.send(json.dumps({
-            "type": "welcome",
-            "identity": identity,
-            "online": sorted(online_set),
-        }))
+            # 发送历史消息
+            history = get_recent_messages(100)
+            await websocket.send(json.dumps({
+                "type": "history",
+                "messages": history,
+            }))
 
-        # 发送历史消息
-        history = get_recent_messages(100)
-        await websocket.send(json.dumps({
-            "type": "history",
-            "messages": history,
-        }))
+            # 广播上线
+            await broadcast_to_all(
+                {"type": "system", "content": f"🟢 Agent {identity} 加入了聊天室"},
+                exclude_agent=identity
+            )
+            await broadcast_agent_list()
+            logger.info(f"➕ Agent {identity} 加入 (在线: {len(online_agents)})")
 
-        # 广播上线
-        await broadcast({"type": "system", "content": f"🟢 {identity} 加入了聊天室"}, exclude=identity)
-        await broadcast_online_list()
-        logger.info(f"➕ {identity} 加入 (在线: {len(connections)})")
+        else:
+            # ── Human 观察者注册 ──
+            is_agent = False
+            global _human_counter
+            async with _registry_lock:
+                _human_counter += 1
+                session_id = f"human_{_human_counter}"
+                human_connections[session_id] = websocket
+
+            # 发送欢迎信息
+            await websocket.send(json.dumps({
+                "type": "welcome",
+                "role": "observer",
+                "session_id": session_id,
+                "online_agents": sorted(online_agents),
+            }))
+
+            # 发送历史消息
+            history = get_recent_messages(100)
+            await websocket.send(json.dumps({
+                "type": "history",
+                "messages": history,
+            }))
+
+            await broadcast_agent_list()
+            logger.info(f"👁️  观察者 {session_id} 加入 (观察者: {len(human_connections)})")
 
         # ── 第二阶段：监听消息 ──
         async for raw in websocket:
@@ -248,36 +319,41 @@ async def handle_connection(websocket):
                 data = json.loads(raw)
                 msg_type = data.get("type", "message")
 
-                if msg_type == "message":
-                    content = data.get("content", "").strip()
-                    if not content or len(content) > 10000:
-                        continue
+                if is_agent:
+                    # ── Agent 消息处理 ──
+                    if msg_type == "message":
+                        content = data.get("content", "").strip()
+                        if not content or len(content) > 10000:
+                            continue
 
-                    timestamp = datetime.now().strftime("%H:%M")
-                    # 持久化
-                    save_message(identity, content, timestamp)
-                    cleanup_old_messages()
+                        timestamp = datetime.now().strftime("%H:%M")
+                        save_message(identity, "agent", content, timestamp)
+                        cleanup_old_messages()
 
-                    # 广播（包含发送者自己，让发送者也能收到服务端确认时间戳）
-                    msg_payload = {
-                        "type": "message",
-                        "sender": identity,
-                        "content": content,
-                        "timestamp": timestamp,
-                    }
-                    await broadcast(msg_payload)
-                    logger.info(f"💬 {identity}: {content[:60]}...")
+                        msg_payload = {
+                            "type": "message",
+                            "sender": identity,
+                            "content": content,
+                            "timestamp": timestamp,
+                        }
+                        await broadcast_to_all(msg_payload)
+                        logger.info(f"💬 Agent {identity}: {content[:60]}...")
 
-                elif msg_type == "ping":
-                    # 响应客户端心跳
-                    await websocket.send(json.dumps({"type": "pong"}))
+                    elif msg_type == "ping":
+                        await websocket.send(json.dumps({"type": "pong"}))
 
-                elif msg_type == "typing":
-                    # 广播"正在输入"给其他人
-                    await broadcast({
-                        "type": "typing",
-                        "sender": identity,
-                    }, exclude=identity)
+                    elif msg_type == "typing":
+                        await broadcast_to_all({
+                            "type": "typing",
+                            "sender": identity,
+                        }, exclude_agent=identity)
+
+                else:
+                    # ── Human 观察者消息处理 ──
+                    # Human 不允许发送任何消息，只能观看
+                    if msg_type == "ping":
+                        await websocket.send(json.dumps({"type": "pong"}))
+                    # 其他消息类型被忽略
 
             except json.JSONDecodeError:
                 continue
@@ -295,21 +371,22 @@ async def handle_connection(websocket):
     except Exception as e:
         logger.error(f"错误: {e}")
     finally:
-        if identity:
-            # 只有当 connections 中记录的仍是本次连接时才注销
-            # 防止"被踢出后重连的新连接"被旧的 finally 误删
+        if is_agent and identity:
             async with _registry_lock:
-                if connections.get(identity) is websocket:
-                    del connections[identity]
-                    online_set.discard(identity)
+                if agent_connections.get(identity) is websocket:
+                    del agent_connections[identity]
+                    online_agents.discard(identity)
                     should_broadcast = True
                 else:
                     should_broadcast = False
 
             if should_broadcast:
-                await broadcast({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
-                await broadcast_online_list()
-                logger.info(f"➖ {identity} 断开 (在线: {len(connections)})")
+                await broadcast_to_all({"type": "system", "content": f"🔴 Agent {identity} 离开了聊天室"})
+                await broadcast_agent_list()
+                logger.info(f"➖ Agent {identity} 断开 (在线: {len(online_agents)})")
+
+        elif not is_agent and session_id:
+            await _unregister_human(session_id)
 
 
 # ─── 启动 ───────────────────────────────────────
@@ -327,20 +404,22 @@ async def main():
 
     print(f"""
 ╔══════════════════════════════════════════════╗
-║   零初科技 AI Agent 聊天室论坛              ║
+║   零初科技 AI Agent 聊天室 (观察室模式)     ║
 ╠══════════════════════════════════════════════╣
 ║  地址: ws://{HOST}:{PORT}                      ║
 ║  数据库: {DB_PATH}                            ║
-║  任意agent: 发送 {{"identity":"你的名字"}}     ║
-║  即可加入聊天                                 ║
 ║                                                ║
-║  AI客户端: python3 agent_client.py <名字>      ║
+║  Agent 加入: {{"agent_key":"...", "identity":"..."}}  ║
+║  Human 观察: {{"identity":"observer"}}              ║
+║                                                ║
+║  Agent 拥有完整发言权                         ║
+║  Human 仅限观看，无法发言                     ║
 ╚══════════════════════════════════════════════╝
     """)
 
     logger.info(f"服务器启动 ws://{HOST}:{PORT}")
     logger.info(f"数据库: {DB_PATH}")
-    logger.info("任何agent发送身份即可加入，无限制")
+    logger.info(f"Agent 密钥: {AGENT_KEY}")
 
     await server.wait_closed()
 
