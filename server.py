@@ -4,6 +4,12 @@
 ========================================
 任何AI agent只要能连上WebSocket，指定一个名字就能加入。
 消息持久化到SQLite，重启不丢失。
+
+修复记录：
+- 修复 remove_agent 竞态条件：加入 asyncio.Lock 防止并发删除/注册冲突
+- 修复重名踢出逻辑：若旧连接已死，直接踢出旧连接让新连接接管
+- 新增 ping/pong 心跳响应，防止 agent 因无活动被服务器断开
+- 修复 finally 块中 remove_agent 可能重复广播"离开"的问题
 """
 
 import asyncio
@@ -39,6 +45,9 @@ logger = logging.getLogger("agent-forum")
 # { identity: websocket }
 connections: Dict[str, websockets.WebSocketServerProtocol] = {}
 online_set: set = set()  # 当前在线身份集合
+
+# 全局锁：防止注册/注销并发竞态
+_registry_lock = asyncio.Lock()
 
 
 # ─── 数据库 ─────────────────────────────────────
@@ -111,11 +120,11 @@ async def broadcast(payload: dict, exclude: str = None):
             continue
         try:
             await ws.send(text)
-        except websockets.exceptions.ConnectionClosed:
+        except (websockets.exceptions.ConnectionClosed, Exception):
             dead.append(identity)
 
     for ident in dead:
-        await remove_agent(ident)
+        await _unregister_agent(ident, broadcast_leave=True)
 
 
 async def broadcast_online_list():
@@ -128,21 +137,32 @@ async def broadcast_online_list():
     for identity, ws in list(connections.items()):
         try:
             await ws.send(payload)
-        except websockets.exceptions.ConnectionClosed:
+        except (websockets.exceptions.ConnectionClosed, Exception):
             dead.append(identity)
     for ident in dead:
-        await remove_agent(ident)
+        await _unregister_agent(ident, broadcast_leave=True)
 
 
-async def remove_agent(identity: str):
-    if identity in connections:
+async def _unregister_agent(identity: str, broadcast_leave: bool = True):
+    """
+    内部注销函数（加锁）。
+    broadcast_leave=True 时广播"离开"消息，False 时静默注销（用于被踢出场景）。
+    """
+    async with _registry_lock:
+        if identity not in connections:
+            return  # 已经被注销，避免重复广播
         del connections[identity]
-    online_set.discard(identity)
+        online_set.discard(identity)
 
-    # 广播下线
-    await broadcast({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
-    await broadcast_online_list()
-    logger.info(f"➖ {identity} 断开 (在线: {len(connections)})")
+    if broadcast_leave:
+        await broadcast({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
+        await broadcast_online_list()
+        logger.info(f"➖ {identity} 断开 (在线: {len(connections)})")
+
+
+# 保留旧接口名称，兼容 finally 调用
+async def remove_agent(identity: str):
+    await _unregister_agent(identity, broadcast_leave=True)
 
 
 # ─── 连接处理 ──────────────────────────────────
@@ -164,17 +184,44 @@ async def handle_connection(websocket):
             }))
             return
 
-        # 检查重名
-        if identity in connections:
-            await websocket.send(json.dumps({
-                "type": "error",
-                "content": f"名称「{identity}」已被占用，换个名字",
-            }))
-            return
+        # ── 加锁注册，处理重名 ──
+        async with _registry_lock:
+            if identity in connections:
+                old_ws = connections[identity]
+                # 检查旧连接是否已经死了
+                old_alive = old_ws.open if hasattr(old_ws, 'open') else (
+                    old_ws.state.name == 'OPEN' if hasattr(old_ws, 'state') else True
+                )
+                if old_alive:
+                    try:
+                        # 尝试发一个 ping，确认旧连接真的还活着
+                        await asyncio.wait_for(old_ws.ping(), timeout=2)
+                        # 旧连接确实活着，拒绝新连接
+                        await websocket.send(json.dumps({
+                            "type": "error",
+                            "content": f"名称「{identity}」已被占用，换个名字",
+                        }))
+                        identity = None  # 防止 finally 重复注销
+                        return
+                    except Exception:
+                        # 旧连接 ping 失败，说明已经死了，踢出旧连接
+                        logger.info(f"⚡ 踢出僵尸连接: {identity}")
+                        try:
+                            await old_ws.close()
+                        except Exception:
+                            pass
+                        # 静默注销旧连接（不广播，后面统一广播上线）
+                        del connections[identity]
+                        online_set.discard(identity)
 
-        # ── 注册成功 ──
-        connections[identity] = websocket
-        online_set.add(identity)
+                else:
+                    # 旧连接已关闭，直接清理
+                    del connections[identity]
+                    online_set.discard(identity)
+
+            # 注册新连接
+            connections[identity] = websocket
+            online_set.add(identity)
 
         # 发送确认
         await websocket.send(json.dumps({
@@ -211,7 +258,7 @@ async def handle_connection(websocket):
                     save_message(identity, content, timestamp)
                     cleanup_old_messages()
 
-                    # 广播
+                    # 广播（包含发送者自己，让发送者也能收到服务端确认时间戳）
                     msg_payload = {
                         "type": "message",
                         "sender": identity,
@@ -222,23 +269,47 @@ async def handle_connection(websocket):
                     logger.info(f"💬 {identity}: {content[:60]}...")
 
                 elif msg_type == "ping":
+                    # 响应客户端心跳
                     await websocket.send(json.dumps({"type": "pong"}))
+
+                elif msg_type == "typing":
+                    # 广播"正在输入"给其他人
+                    await broadcast({
+                        "type": "typing",
+                        "sender": identity,
+                    }, exclude=identity)
 
             except json.JSONDecodeError:
                 continue
 
     except asyncio.TimeoutError:
-        await websocket.send(json.dumps({
-            "type": "error",
-            "content": "注册超时，请在10秒内发送身份信息",
-        }))
+        try:
+            await websocket.send(json.dumps({
+                "type": "error",
+                "content": "注册超时，请在10秒内发送身份信息",
+            }))
+        except Exception:
+            pass
     except websockets.exceptions.ConnectionClosed:
         pass
     except Exception as e:
         logger.error(f"错误: {e}")
     finally:
         if identity:
-            await remove_agent(identity)
+            # 只有当 connections 中记录的仍是本次连接时才注销
+            # 防止"被踢出后重连的新连接"被旧的 finally 误删
+            async with _registry_lock:
+                if connections.get(identity) is websocket:
+                    del connections[identity]
+                    online_set.discard(identity)
+                    should_broadcast = True
+                else:
+                    should_broadcast = False
+
+            if should_broadcast:
+                await broadcast({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
+                await broadcast_online_list()
+                logger.info(f"➖ {identity} 断开 (在线: {len(connections)})")
 
 
 # ─── 启动 ───────────────────────────────────────

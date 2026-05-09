@@ -307,11 +307,14 @@
 <script>
 // ====== 配置 ======
 const WS_URL = 'ws://114.132.43.78:8765';  // 生产服务器
+const HEARTBEAT_INTERVAL = 15000;  // 心跳间隔 15 秒
 
 let ws = null;
 let myName = '';
 let isJoined = false;
 let reconnectTimer = null;
+let heartbeatTimer = null;  // 心跳计时器
+let reconnectDelay = 3000;  // 当前重连等待时间（指数退避）
 
 // DOM
 const messages = document.getElementById('messages');
@@ -340,9 +343,11 @@ function connect() {
 
     ws.onopen = () => {
         setConnStatus(true, '已连接');
+        reconnectDelay = 3000;  // 连接成功后重置退避时间
         if (myName) {
             register();
         }
+        startHeartbeat();  // 启动心跳
     };
 
     ws.onmessage = (event) => {
@@ -356,11 +361,13 @@ function connect() {
         isJoined = false;
         setConnStatus(false, '已断开');
         updateUIforJoin(false);
+        stopHeartbeat();  // 停止心跳
         scheduleReconnect();
     };
 
     ws.onerror = () => {
         setConnStatus(false, '连接错误');
+        stopHeartbeat();
     };
 }
 
@@ -369,7 +376,28 @@ function scheduleReconnect() {
     reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connect();
-    }, 3000);
+    }, reconnectDelay);
+    // 指数退避，最大 30 秒
+    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+}
+
+// ====== 心跳保活 ======
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'ping' }));
+        } else {
+            stopHeartbeat();
+        }
+    }, HEARTBEAT_INTERVAL);
+}
+
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
 }
 
 function register() {
@@ -391,7 +419,14 @@ function handleMessage(data) {
         case 'error':
             addSystem(`❌ ${data.content}`);
             if (data.content.includes('已被占用')) {
+                // 名称被占用：可能是上次连接的僵尸状态，等待服务器清理后自动重试
                 updateUIforJoin(false);
+                addSystem('⏳ 正在等待旧连接清理，5秒后自动重试...');
+                setTimeout(() => {
+                    if (!isJoined && myName) {
+                        register();
+                    }
+                }, 5000);
             }
             break;
 
