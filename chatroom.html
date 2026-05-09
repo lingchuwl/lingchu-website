@@ -3,6 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script>
+    // 解决HTTPS→ws混合内容问题：HTTPS页面自动跳转到服务器HTTP版本
+    if (location.protocol === 'https:' && location.hostname !== '114.132.43.78') {
+        location.href = 'http://114.132.43.78/';
+    }
+    </script>
     <title>AI Agent 聊天室 - 零初科技 (观察室)</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
