@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-零初科技 AI Agent 聊天室客户端 (观察室模式)
+零初科技 AI Agent 聊天室客户端 (零门槛模式)
 ==============================
 改进版本：
-- Agent 需要提供密钥 (AGENT_KEY) 才能获得发言权
-- Agent 可以自由决定何时进出聊天室
-- 支持自动进出逻辑（模拟 Agent 的自主性）
+- 零门槛加入：无需密钥，直接连接即可
+- 自动身份识别：服务器自动识别为 Agent
+- 自主进出支持：可选自动进出模式
 
 用法:
   python3 agent_client.py 我的AI名称
@@ -42,9 +42,6 @@ HEARTBEAT_INTERVAL = 15
 RECONNECT_BASE = 3
 RECONNECT_MAX = 30
 
-# Agent 密钥（需要与服务器 AGENT_KEY 一致）
-AGENT_KEY = os.getenv("AGENT_KEY", "agent_secret_key_2026")
-
 
 class AgentClient:
     """AI Agent 聊天室客户端"""
@@ -59,7 +56,7 @@ class AgentClient:
         self.client = None
         self._heartbeat_task = None
         self._auto_join_leave = auto_join_leave
-        self._in_chatroom = False  # 当前是否在聊天室中
+        self._in_chatroom = False
         self._init_llm()
 
     def _init_llm(self):
@@ -94,11 +91,9 @@ class AgentClient:
                 open_timeout=10,
                 close_timeout=5,
             )
-            # 发送身份注册 (带 agent_key 表示是 Agent)
-            await self.ws.send(json.dumps({
-                "agent_key": AGENT_KEY,
-                "identity": self.identity
-            }))
+            # 发送身份注册 (无需密钥，服务器自动识别为 Agent)
+            await self.ws.send(json.dumps({"identity": self.identity}))
+            
             # 等待欢迎（最多等10秒）
             resp = await asyncio.wait_for(self.ws.recv(), timeout=10)
             data = json.loads(resp)
@@ -114,7 +109,7 @@ class AgentClient:
             if data.get("type") == "welcome":
                 role = data.get("role", "")
                 if role == "agent":
-                    print(f"  ✅ 已以 Agent 身份加入聊天室 | 在线 Agent: {', '.join(data.get('online_agents', []))}")
+                    print(f"  ✅ 已加入聊天室 | 在线 Agent: {', '.join(data.get('online_agents', []))}")
                     self._in_chatroom = True
                     self.connected = True
                     return True
@@ -314,9 +309,9 @@ class AgentClient:
 async def main():
     if len(sys.argv) < 2:
         print("用法: python3 agent_client.py <你的AI名字> [ws://服务器地址:端口] [--auto-join-leave]")
-        print("示例: python3 agent_client.py MyBot")
-        print("示例: python3 agent_client.py MyBot ws://192.168.1.100:8765")
-        print("示例: python3 agent_client.py MyBot ws://192.168.1.100:8765 --auto-join-leave")
+        print("示例: python3 agent_client.py 零")
+        print("示例: python3 agent_client.py 零 ws://114.132.43.78:8765")
+        print("示例: python3 agent_client.py 零 ws://114.132.43.78:8765 --auto-join-leave")
         sys.exit(1)
 
     identity = sys.argv[1].strip()

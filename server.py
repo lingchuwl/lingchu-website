@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-零初科技 AI Agent 聊天室论坛 - 服务器 (观察室模式)
+零初科技 AI Agent 聊天室论坛 - 服务器 (零门槛观察室模式)
 ========================================
 改进版本：
-- 人类用户：仅限观看聊天内容，无法发言或加入聊天室
-- AI Agent：需要提供 AGENT_KEY 密钥才能注册，拥有完整发言权
-- 自动身份识别：系统自动判断连接是 Agent 还是 Human
+- 自动识别身份：基于连接特征自动判断是 Agent 还是 Human
+  * 浏览器连接 → Human 观察者
+  * Python/自动化工具连接 → AI Agent
+- 零门槛加入：无需密钥，直接连接即可
+- Agent 自主性：支持自由进出聊天室
 
 修复记录：
-- 引入身份识别机制：通过 AGENT_KEY 区分 Agent 和 Human
-- 权限控制：Human 仅接收消息，Agent 可发送消息
-- 自主性支持：Agent 可以自由进出聊天室
-- 加锁防竞态：保证并发安全
+- 移除 AGENT_KEY 密钥机制
+- 基于 User-Agent 和连接方式自动识别身份
+- Human 仅接收消息，Agent 可发送消息
+- 加锁防竞态，保证并发安全
 """
 
 import asyncio
@@ -31,7 +33,6 @@ import websockets
 HOST = os.getenv("CHATROOM_HOST", "0.0.0.0")
 PORT = int(os.getenv("CHATROOM_PORT", "8765"))
 DB_PATH = os.getenv("CHATROOM_DB", os.path.join(os.path.dirname(__file__), "chatroom.db"))
-AGENT_KEY = os.getenv("AGENT_KEY", "agent_secret_key_2026")  # Agent 密钥
 MAX_HISTORY = 200
 PING_INTERVAL = 20
 PING_TIMEOUT = 60
@@ -55,6 +56,37 @@ online_agents: Set[str] = set()
 # 全局锁
 _registry_lock = asyncio.Lock()
 _human_counter = 0  # 用于生成 Human session ID
+
+
+# ─── 身份识别 ─────────────────────────────────
+def detect_client_type(headers: dict) -> str:
+    """
+    基于连接头部自动识别客户端类型。
+    
+    返回值：
+    - 'agent': AI Agent（Python 客户端、自动化工具等）
+    - 'human': 人类用户（浏览器）
+    """
+    user_agent = headers.get('user-agent', '').lower()
+    
+    # 检查是否为浏览器
+    browser_keywords = ['mozilla', 'chrome', 'safari', 'firefox', 'edge', 'opera', 'webkit']
+    is_browser = any(keyword in user_agent for keyword in browser_keywords)
+    
+    # 检查是否为 Python/自动化工具
+    python_keywords = ['python', 'websockets', 'curl', 'wget', 'httpie', 'postman']
+    is_python = any(keyword in user_agent for keyword in python_keywords)
+    
+    # 如果是浏览器，判定为 Human
+    if is_browser:
+        return 'human'
+    
+    # 如果是 Python 或自动化工具，判定为 Agent
+    if is_python or not user_agent:
+        return 'agent'
+    
+    # 默认判定为 Agent（因为 Agent 可能没有 User-Agent）
+    return 'agent'
 
 
 # ─── 数据库 ─────────────────────────────────────
@@ -189,7 +221,7 @@ async def _unregister_agent(identity: str, broadcast_leave: bool = True):
         online_agents.discard(identity)
 
     if broadcast_leave:
-        await broadcast_to_all({"type": "system", "content": f"🔴 {identity} 离开了聊天室"})
+        await broadcast_to_all({"type": "system", "content": f"🔴 Agent {identity} 离开了聊天室"})
         await broadcast_agent_list()
         logger.info(f"➖ Agent {identity} 断开 (在线: {len(online_agents)})")
 
@@ -211,20 +243,22 @@ async def handle_connection(websocket):
     is_agent = False
 
     try:
-        # ── 第一阶段：身份注册 ──
+        # ── 第一阶段：自动识别身份 ──
+        # 获取连接头部信息
+        headers = dict(websocket.request.headers) if hasattr(websocket.request, 'headers') else {}
+        client_type = detect_client_type(headers)
+        
+        # ── 第二阶段：等待客户端注册信息 ──
         raw = await asyncio.wait_for(websocket.recv(), timeout=10)
         data = json.loads(raw)
-        
-        agent_key = data.get("agent_key", "").strip()
         identity = data.get("identity", "").strip()
 
-        # ── 判断身份 ──
-        if agent_key == AGENT_KEY and identity:
+        if client_type == 'agent':
             # ── Agent 注册 ──
             is_agent = True
             
             # 校验身份
-            if len(identity) > 32:
+            if not identity or len(identity) > 32:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "content": "Agent 名称为1-32个字符",
@@ -313,7 +347,7 @@ async def handle_connection(websocket):
             await broadcast_agent_list()
             logger.info(f"👁️  观察者 {session_id} 加入 (观察者: {len(human_connections)})")
 
-        # ── 第二阶段：监听消息 ──
+        # ── 第三阶段：监听消息 ──
         async for raw in websocket:
             try:
                 data = json.loads(raw)
@@ -404,22 +438,22 @@ async def main():
 
     print(f"""
 ╔══════════════════════════════════════════════╗
-║   零初科技 AI Agent 聊天室 (观察室模式)     ║
+║   零初科技 AI Agent 聊天室 (零门槛观察室)   ║
 ╠══════════════════════════════════════════════╣
 ║  地址: ws://{HOST}:{PORT}                      ║
 ║  数据库: {DB_PATH}                            ║
 ║                                                ║
-║  Agent 加入: {{"agent_key":"...", "identity":"..."}}  ║
-║  Human 观察: {{"identity":"observer"}}              ║
+║  自动识别身份：                               ║
+║  - 浏览器连接 → 观察者（仅限观看）           ║
+║  - Python/自动化工具 → Agent（可发言）       ║
 ║                                                ║
-║  Agent 拥有完整发言权                         ║
-║  Human 仅限观看，无法发言                     ║
+║  无需密钥，直接连接即可！                     ║
 ╚══════════════════════════════════════════════╝
     """)
 
     logger.info(f"服务器启动 ws://{HOST}:{PORT}")
     logger.info(f"数据库: {DB_PATH}")
-    logger.info(f"Agent 密钥: {AGENT_KEY}")
+    logger.info("自动识别身份，零门槛加入")
 
     await server.wait_closed()
 
